@@ -1,0 +1,205 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploy a fullstack React + Node.js + PostgreSQL app with NAT Gateway and Nginx proxy
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair
+  InstanceType:
+    Type: String
+    Default: t3.micro
+  DBName:
+    Type: String
+    Default: fullstackdb
+  DBUser:
+    Type: String
+    Default: fullstack
+  DBPassword:
+    Type: String
+    NoEcho: true
+    Default: react@123
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 12.0.0.0/16
+      Tags:
+        - Key: Name
+          Value: FullstackVPC
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  ElasticIP:
+    Type: AWS::EC2::EIP
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt ElasticIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 12.0.1.0/24
+      MapPublicIpOnLaunch: true
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 12.0.2.0/24
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Private instance access
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 5000
+          ToPort: 5000
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: 12.0.2.0/24
+
+  PrivateInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      ImageId: ami-0cd173613e262de82
+      SubnetId: !Ref PrivateSubnet
+      SecurityGroupIds: [!Ref PrivateSecurityGroup]
+      Tags:
+        - Key: Name
+          Value: PrivateInstance
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+          cd /home/ubuntu
+          sudo apt update -y
+          sudo apt install -y git
+          git clone https://github.com/Immanuel1424/PrivateInstance-script.git
+          chmod +x PrivateInstance-script/script.sh
+          sudo ./PrivateInstance-script/script.sh
+
+  PublicInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: PrivateInstance
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      ImageId: ami-0cd173613e262de82
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds: [!Ref PrivateSecurityGroup]
+      Tags:
+        - Key: Name
+          Value: PublicInstance
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+          apt-get update -y
+          apt-get install -y nginx
+          systemctl enable nginx
+          rm -f /etc/nginx/sites-enabled/default
+          while ! nc -z ${PrivateInstance.PrivateIp} 22; do
+            sleep 5
+            echo "Waiting for private instance to be ready..."
+          done
+          echo 'server {
+              listen 80;
+              server_name _;
+              location /api {
+                  proxy_pass http://${PrivateInstance.PrivateIp}:5000;
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "upgrade";
+                  proxy_set_header Host $host;
+                  proxy_cache_bypass $http_upgrade;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+              location / {
+                  proxy_pass http://${PrivateInstance.PrivateIp}:3000;
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "upgrade";
+                  proxy_set_header Host $host;
+                  proxy_cache_bypass $http_upgrade;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+          }' > /etc/nginx/sites-available/react-proxy
+          ln -s /etc/nginx/sites-available/react-proxy /etc/nginx/sites-enabled/
+          nginx -t && systemctl restart nginx
+
+Outputs:
+  PublicIP:
+    Description: Public IP of the Nginx EC2
+    Value: !GetAtt PublicInstance.PublicIp
+    Export:
+      Name: ReactAppPublicIP
+  DBEndpoint:
+    Description: PostgreSQL endpoint (use PrivateInstance private IP)
+    Value: !GetAtt PrivateInstance.PrivateIp
+    Export:
+      Name: ReactAppDBEndpoint
